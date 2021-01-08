@@ -411,15 +411,8 @@ IOReturn VoodooI2CHIDDevice::setPowerState(unsigned long whichState, IOService* 
         if (!awake) {
             awake = true;
 
-            setHIDPowerState(kVoodooI2CStateOn);
-
-            VoodooI2CHIDDeviceCommand command;
-            command.c.reg = hid_descriptor.wCommandRegister;
-            command.c.opcode = 0x01;
-            command.c.report_type_id = 0;
-
-            api->writeI2C(command.data, 4);
-            IOSleep(10);
+            if (setHIDPowerState(kVoodooI2CStateOn) != kIOReturnSuccess)
+                resetHIDDeviceGated();
 
             startInterrupt();
 
