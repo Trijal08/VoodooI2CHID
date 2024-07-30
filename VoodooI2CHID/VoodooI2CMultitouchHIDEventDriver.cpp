@@ -23,12 +23,18 @@ OSDefineMetaClassAndStructors(VoodooI2CMultitouchHIDEventDriver, IOHIDEventServi
 
 AbsoluteTime last_multi_touch_event = 0;
 
-static int pow(int x, int y) {
-    int ret = 1;
-    while (y > 0) {
-        ret *= x;
-        y--;
+static int scientific_pow(UInt32 significand, UInt32 base, SInt32 exponent) {
+    UInt32 ret = significand;
+    while (exponent > 0) {
+        ret *= base;
+        exponent--;
     }
+
+    while (exponent < 0) {
+        ret /= base;
+        exponent++;
+    }
+
     return ret;
 }
 
@@ -42,12 +48,12 @@ void VoodooI2CMultitouchHIDEventDriver::calibrateJustifiedPreferredStateElement(
     element->setCalibration(0, 1, sat_min, sat_max);
 }
 
-bool VoodooI2CMultitouchHIDEventDriver::didTerminate(IOService* provider, IOOptionBits options, bool* defer) {
+bool VoodooI2CMultitouchHIDEventDriver::willTerminate(IOService* provider, IOOptionBits options) {
     if (hid_interface)
         hid_interface->close(this);
     hid_interface = NULL;
     
-    return super::didTerminate(provider, options, defer);
+    return super::willTerminate(provider, options);
 }
 
 void VoodooI2CMultitouchHIDEventDriver::forwardReport(VoodooI2CMultitouchEvent event, AbsoluteTime timestamp) {
@@ -168,10 +174,14 @@ void VoodooI2CMultitouchHIDEventDriver::handleDigitizerReport(AbsoluteTime times
     }
     
     // Now handle button report
-    if (digitiser.button) {
+    if (digitiser.primaryButton) { // there can't be secondary button without primary
         VoodooI2CDigitiserTransducer* transducer = OSDynamicCast(VoodooI2CDigitiserTransducer, digitiser.transducers->getObject(0));
         if (transducer) {
-            setButtonState(&transducer->physical_button, 0, digitiser.button->getValue(), timestamp);
+            setButtonState(&transducer->physical_button, 0, digitiser.primaryButton->getValue(), timestamp);
+            if (digitiser.secondaryButton) {
+                transducer->has_secondary_button = true;
+                setButtonState(&transducer->physical_button, 1, digitiser.secondaryButton->getValue(), timestamp);
+            }
         }
     }
 
@@ -259,7 +269,16 @@ void VoodooI2CMultitouchHIDEventDriver::handleDigitizerTransducerReport(VoodooI2
                 }
                 break;
             case kHIDPage_Button:
-                setButtonState(&transducer->physical_button, (usage - 1), value, timestamp);
+                if (usage == kHIDUsage_Button_1) {
+                    // kHIDUsage_Button_1 is for the clickpad surface
+                    setButtonState(&transducer->physical_button, 0, value, timestamp);
+                } else {
+                    // kHIDUsage_Button_2/3 are for external buttons, thus should be reported
+                    // through the trackpoint device.
+                    transducer->has_secondary_button = true;
+                    setButtonState(&transducer->physical_button, (usage - 2), value, timestamp);
+                }
+                
                 handled    |= element_is_current;
                 break;
             case kHIDPage_Digitizer:
@@ -422,7 +441,7 @@ bool VoodooI2CMultitouchHIDEventDriver::handleStart(IOService* provider) {
     if (!digitiser.transducers)
         return false;
 
-    if (parseElements() != kIOReturnSuccess) {
+    if (parseElements(kHIDUsage_Dig_Any) != kIOReturnSuccess) {
         IOLog("%s::%s Could not parse multitouch elements\n", getName(), name);
         return false;
     }
@@ -440,14 +459,9 @@ bool VoodooI2CMultitouchHIDEventDriver::handleStart(IOService* provider) {
 }
 
 void VoodooI2CMultitouchHIDEventDriver::handleStop(IOService* provider) {
-    OSSafeReleaseNULL(digitiser.transducers);
-    OSSafeReleaseNULL(digitiser.wrappers);
-    OSSafeReleaseNULL(digitiser.styluses);
-    OSSafeReleaseNULL(digitiser.fingers);
-    
     unregisterHIDPointerNotifications();
     OSSafeReleaseNULL(attached_hid_pointer_devices);
-
+    
     if (multitouch_interface) {
         multitouch_interface->stop(this);
         multitouch_interface->detach(this);
@@ -461,8 +475,36 @@ void VoodooI2CMultitouchHIDEventDriver::handleStop(IOService* provider) {
 
     OSSafeReleaseNULL(work_loop);
 
+    
+    OSSafeReleaseNULL(digitiser.transducers);
+    OSSafeReleaseNULL(digitiser.wrappers);
+    OSSafeReleaseNULL(digitiser.styluses);
+    OSSafeReleaseNULL(digitiser.fingers);
+
     PMstop();
     super::handleStop(provider);
+}
+
+UInt32 VoodooI2CMultitouchHIDEventDriver::parseElementPhysicalMax(IOHIDElement* element) {
+    UInt32 physical_max = element->getPhysicalMax();
+
+    UInt8 raw_unit_exponent = element->getUnitExponent();
+    if (raw_unit_exponent >> 3) {
+        raw_unit_exponent = raw_unit_exponent | 0xf0; // Raise the 4-bit int to an 8-bit int
+    }
+    SInt8 unit_exponent = *reinterpret_cast<SInt8*>(&raw_unit_exponent);
+
+    // Scale to 0.01 mm units
+    UInt32 unit = element->getUnit();
+    if (unit == kHIDUsage_LengthUnitCentimeter) {
+        unit_exponent += 3;
+    } else if (unit == kHIDUsage_LengthUnitInch) {
+        physical_max *= 254;
+        unit_exponent += 1;
+    }
+
+    physical_max = scientific_pow(physical_max, 10, unit_exponent);
+    return physical_max;
 }
 
 IOReturn VoodooI2CMultitouchHIDEventDriver::parseDigitizerElement(IOHIDElement* digitiser_element) {
@@ -515,46 +557,12 @@ IOReturn VoodooI2CMultitouchHIDEventDriver::parseDigitizerElement(IOHIDElement* 
                 if (sub_element->conformsTo(kHIDPage_GenericDesktop, kHIDUsage_GD_X)) {
                     if (multitouch_interface && !multitouch_interface->logical_max_x) {
                         multitouch_interface->logical_max_x = sub_element->getLogicalMax();
-                        
-                        UInt32 raw_physical_max_x = sub_element->getPhysicalMax();
-                        
-                        UInt8 raw_unit_exponent = sub_element->getUnitExponent();
-                        if (raw_unit_exponent >> 3) {
-                            raw_unit_exponent = raw_unit_exponent | 0xf0; // Raise the 4-bit int to an 8-bit int
-                        }
-                        SInt8 unit_exponent = *(SInt8 *)&raw_unit_exponent;
-                        
-                        UInt32 physical_max_x = raw_physical_max_x;
-                        
-                        physical_max_x *= pow(10, (unit_exponent - -2));
-                        
-                        if (sub_element->getUnit() == 0x13) {
-                            physical_max_x *= 2.54;
-                        }
-
-                        multitouch_interface->physical_max_x = physical_max_x;
+                        multitouch_interface->physical_max_x = parseElementPhysicalMax(sub_element);
                     }
                 } else if (sub_element->conformsTo(kHIDPage_GenericDesktop, kHIDUsage_GD_Y)) {
                     if (multitouch_interface && !multitouch_interface->logical_max_y) {
                         multitouch_interface->logical_max_y = sub_element->getLogicalMax();
-                        
-                        UInt32 raw_physical_max_y = sub_element->getPhysicalMax();
-                        
-                        UInt8 raw_unit_exponent = sub_element->getUnitExponent();
-                        if (raw_unit_exponent >> 3) {
-                            raw_unit_exponent = raw_unit_exponent | 0xf0; // Raise the 4-bit int to an 8-bit int
-                        }
-                        SInt8 unit_exponent = *(SInt8 *)&raw_unit_exponent;
-                        
-                        UInt32 physical_max_y = raw_physical_max_y;
-                        
-                        physical_max_y *= pow(10, (unit_exponent - -2));
-                        
-                        if (sub_element->getUnit() == 0x13) {
-                            physical_max_y *= 2.54;
-                        }
-                        
-                        multitouch_interface->physical_max_y = physical_max_y;
+                        multitouch_interface->physical_max_y = parseElementPhysicalMax(sub_element);
                     }
                 }
             }
@@ -577,15 +585,30 @@ IOReturn VoodooI2CMultitouchHIDEventDriver::parseDigitizerElement(IOHIDElement* 
             continue;
         }
         
-        if (element->conformsTo(kHIDPage_Button, kHIDUsage_Button_1)) {
-            digitiser.button = element;
+        // On some machines (Namely Dell Latitude 7390 2-in-1) the primary button has kHIDUsage_Button_2, and the secondary button has kHIDUsage_Button_3
+        // Address cases involving kHIDUsage_Button_3
+        if (element->conformsTo(kHIDPage_Button) && element->getUsage() <= kHIDUsage_Button_3) {
+            if (digitiser.primaryButton == nullptr) {
+                digitiser.primaryButton = element;
+            }
+            else if (element->getUsage() > digitiser.primaryButton->getUsage()) {
+                // Candidate for a secondary button
+                if (digitiser.secondaryButton == nullptr || element->getUsage() < digitiser.secondaryButton->getUsage()) {
+                    digitiser.secondaryButton = element;
+                }
+            }
+            else if (element->getUsage() < digitiser.primaryButton->getUsage()) {
+                // This is the new primary button. Old primary becomes secondary.
+                digitiser.secondaryButton = digitiser.primaryButton;
+                digitiser.primaryButton = element;
+            }
         }
     }
 
     return kIOReturnSuccess;
 }
     
-IOReturn VoodooI2CMultitouchHIDEventDriver::parseElements() {
+IOReturn VoodooI2CMultitouchHIDEventDriver::parseElements(UInt32 usage) {
     int index, count;
 
     OSArray* supported_elements = OSDynamicCast(OSArray, hid_device->getProperty(kIOHIDElementKey));
@@ -602,17 +625,30 @@ IOReturn VoodooI2CMultitouchHIDEventDriver::parseElements() {
 
         if (element->getUsage() == 0)
             continue;
-
-        if (element->conformsTo(kHIDPage_Digitizer, kHIDUsage_Dig_Pen)
-            || element->conformsTo(kHIDPage_Digitizer, kHIDUsage_Dig_TouchScreen)
-            || element->conformsTo(kHIDPage_Digitizer, kHIDUsage_Dig_TouchPad)
-            || element->conformsTo(kHIDPage_Digitizer, kHIDUsage_Dig_DeviceConfiguration)
-            )
-            parseDigitizerElement(element);
         
-        if (multitouch_interface && element->conformsTo(kHIDPage_Digitizer, kHIDUsage_Dig_TouchScreen))
+        /*
+         * Parse digitzer elements depending on which Event Driver is attaching.
+         * Precision/TouchScreen are specifically looking for kHIDUsage_Dig_TouchPad/TouchScreen respectively.
+         * Generic Multitouch looks for any supported Digitizer element (usage == kHIDUsage_Dig_Any).
+         * kHIDUsage_Dig_Pen and kHIDUsage_Dig_DeviceConfiguration are valid for both of the cases above.
+         */
+        
+        if (element->conformsTo(kHIDPage_Digitizer, kHIDUsage_Dig_Pen)
+            || element->conformsTo(kHIDPage_Digitizer, kHIDUsage_Dig_DeviceConfiguration)) {
+            parseDigitizerElement(element);
+        } else if (usage != kHIDUsage_Dig_Any && element->conformsTo(kHIDPage_Digitizer, usage)) {
+            parseDigitizerElement(element);
+        } else if (usage == kHIDUsage_Dig_Any
+                   && (element->conformsTo(kHIDPage_Digitizer, kHIDUsage_Dig_TouchScreen)
+                       || element->conformsTo(kHIDPage_Digitizer, kHIDUsage_Dig_TouchPad))) {
+            parseDigitizerElement(element);
+        }
+        
+        if ((usage == kHIDUsage_Dig_Any || usage == kHIDUsage_Dig_TouchScreen)
+            && multitouch_interface && element->conformsTo(kHIDPage_Digitizer, kHIDUsage_Dig_TouchScreen)) {
             multitouch_interface->setProperty(kIOHIDDisplayIntegratedKey, kOSBooleanTrue);
         }
+    }
     
 
     if (digitiser.styluses->getCount() == 0 && digitiser.fingers->getCount() == 0)
@@ -735,7 +771,8 @@ void VoodooI2CMultitouchHIDEventDriver::setDigitizerProperties() {
     properties->setObject("Contact Count Element",         digitiser.contact_count);
     properties->setObject("Input Mode Element",            digitiser.input_mode);
     properties->setObject("Contact Count Maximum Element", digitiser.contact_count_maximum);
-    properties->setObject("Button Element",                digitiser.button);
+    properties->setObject("Primary Button Element",        digitiser.primaryButton);
+    properties->setObject("Secondary Button Element",      digitiser.secondaryButton);
     setOSDictionaryNumber(properties, "Transducer Count",  digitiser.transducers->getCount());
 
     setProperty("Digitizer", properties);

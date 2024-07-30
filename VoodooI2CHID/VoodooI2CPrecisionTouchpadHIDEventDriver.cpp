@@ -12,19 +12,12 @@
 OSDefineMetaClassAndStructors(VoodooI2CPrecisionTouchpadHIDEventDriver, VoodooI2CMultitouchHIDEventDriver);
 
 void VoodooI2CPrecisionTouchpadHIDEventDriver::enterPrecisionTouchpadMode() {
-    // We should really do this using `input_mode_element->setValue(INPUT_MODE_TOUCHPAD)`
-    // but I am not able to get it to work.
-
-    VoodooI2CPrecisionTouchpadFeatureReport buffer;
-    buffer.value = INPUT_MODE_TOUCHPAD;
-    buffer.reserved = 0x00;
-
-    IOBufferMemoryDescriptor* report = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, 0, sizeof(VoodooI2CPrecisionTouchpadFeatureReport));
-    report->writeBytes(0, &buffer, sizeof(VoodooI2CPrecisionTouchpadFeatureReport));
-
-    hid_interface->setReport(report, kIOHIDReportTypeFeature, digitiser.input_mode->getReportID());
-    report->release();
-
+    UInt8 inputMode[] = { INPUT_MODE_TOUCHPAD };
+    
+    // Use setDataValue as it does not check for duplicate writes
+    OSData *value = OSData::withBytes(inputMode, sizeof(inputMode));
+    digitiser.input_mode->setDataValue(value);
+    OSSafeReleaseNULL(value);
     ready = true;
 }
 
@@ -47,6 +40,10 @@ bool VoodooI2CPrecisionTouchpadHIDEventDriver::handleStart(IOService* provider) 
     enterPrecisionTouchpadMode();
 
     return true;
+}
+
+IOReturn VoodooI2CPrecisionTouchpadHIDEventDriver::parseElements(UInt32) {
+    return super::parseElements(kHIDUsage_Dig_TouchPad);
 }
 
 IOReturn VoodooI2CPrecisionTouchpadHIDEventDriver::setPowerState(unsigned long whichState, IOService* whatDevice) {

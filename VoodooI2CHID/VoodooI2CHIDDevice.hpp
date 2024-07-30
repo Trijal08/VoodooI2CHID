@@ -26,6 +26,24 @@
 #define I2C_HID_PWR_ON  0x00
 #define I2C_HID_PWR_SLEEP 0x01
 
+
+#define I2C_HID_QUIRK_NO_IRQ_AFTER_RESET    BIT(1)
+#define I2C_HID_QUIRK_RESET_ON_RESUME       BIT(5)
+
+#define HID_ANY_ID  0xFFFF
+
+#define USB_VENDOR_ID_ALPS_JP   0x044E
+
+#define I2C_VENDOR_ID_HANTICK       0x0911
+#define I2C_PRODUCT_ID_HANTICK_5288 0x5288
+
+#define I2C_VENDOR_ID_RAYDIUM       0x2386
+#define I2C_PRODUCT_ID_RAYDIUM_3118 0x3118
+
+#define I2C_VENDOR_ID_SYNAPTICS             0x06cb
+#define I2C_PRODUCT_ID_SYNAPTICS_SYNA2393   0x7a13
+
+
 #define EXPORT __attribute__((visibility("default")))
 
 typedef union {
@@ -54,6 +72,22 @@ typedef struct __attribute__((__packed__)) {
     UInt32 reserved;
 } VoodooI2CHIDDeviceHIDDescriptor;
 
+static const struct i2c_hid_quirks {
+    UInt16 idVendor;
+    UInt16 idProduct;
+    UInt32 quirks;
+} i2c_hid_quirks[] = {
+    { I2C_VENDOR_ID_HANTICK, I2C_PRODUCT_ID_HANTICK_5288,
+        I2C_HID_QUIRK_NO_IRQ_AFTER_RESET },
+    { I2C_VENDOR_ID_RAYDIUM, I2C_PRODUCT_ID_RAYDIUM_3118,
+        I2C_HID_QUIRK_NO_IRQ_AFTER_RESET },
+    { USB_VENDOR_ID_ALPS_JP, HID_ANY_ID,
+        I2C_HID_QUIRK_RESET_ON_RESUME },
+    { I2C_VENDOR_ID_SYNAPTICS, I2C_PRODUCT_ID_SYNAPTICS_SYNA2393,
+        I2C_HID_QUIRK_RESET_ON_RESUME },
+    { 0, 0 }
+};
+
 class VoodooI2CDeviceNub;
 
 /* Implements an I2C-HID device as specified by Microsoft's protocol in the following document: http://download.microsoft.com/download/7/D/D/7DD44BB7-2A7A-4505-AC1C-7227D3D96D5B/hid-over-i2c-protocol-spec-v1-0.docx
@@ -77,7 +111,7 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
      * @return *true* upon successful initialisation, *false* otherwise
      */
 
-    virtual bool init(OSDictionary* properties);
+    bool init(OSDictionary* properties) override;
 
     /* Frees the <VoodooI2CHIDDevice> object
      *
@@ -85,7 +119,7 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
      * frees the memory allocated in <init>.
      */
 
-    virtual void free();
+    void free() override;
 
     /*
      * Issues an I2C-HID command to get the HID descriptor from the device.
@@ -102,7 +136,7 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
 
     IOReturn getHIDDescriptorAddress();
     
-    IOReturn getReport(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options);
+    IOReturn getReport(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options) override;
     
     IOReturn parseHIDDescriptor();
 
@@ -116,7 +150,7 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
      * @return A pointer to this instance of VoodooI2CHID upon succesful probe, else NULL
      */
 
-    VoodooI2CHIDDevice* probe(IOService* provider, SInt32* score);
+    VoodooI2CHIDDevice* probe(IOService* provider, SInt32* score) override;
 
     /* Run during the <IOHIDDevice::start> routine
      * @provider The provider which we have matched against
@@ -127,7 +161,7 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
      * @return *true* upon successful start, *false* otherwise
      */
 
-    bool handleStart(IOService* provider);
+    bool handleStart(IOService* provider) override;
     
     void simulateInterrupt(OSObject* owner, IOTimerEventSource* timer);
     
@@ -137,7 +171,7 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
      * @return *true* upon successful start, *false* otherwise
      */
     
-    bool start(IOService* provider);
+    bool start(IOService* provider) override;
 
     /* Stops the I2C-HID Device
      * @provider The provider which we have matched against
@@ -146,7 +180,7 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
      * that were allocated in <start>.
      */
 
-    void stop(IOService* provider);
+    void stop(IOService* provider) override;
 
     /* Create and return a new memory descriptor that describes the report descriptor for the HID device
      * @descriptor Pointer to the memory descriptor returned. This memory descriptor will be released by the caller.
@@ -229,7 +263,7 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
      * @return *kIOPMAckImplied* on succesful state change, *kIOReturnError* otherwise
      */
 
-    IOReturn setPowerState(unsigned long whichState, IOService* whatDevice);
+    IOReturn setPowerState(unsigned long whichState, IOService* whatDevice) override;
 
     /* Issues an I2C-HID set report command.
      * @report The report data to be sent to the device
@@ -239,8 +273,14 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
      * @return *kIOReturnSuccess* on successful power state change, *kIOReturnTimeout* otherwise
      */
 
-    IOReturn setReport(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options);
-    
+    IOReturn setReport(IOMemoryDescriptor* report, IOHIDReportType reportType, IOOptionBits options) override;
+
+    /*
+     * Lookup and set any quirks associated with the I2C HID device.
+     */
+
+    void lookupQuirks();
+
  private:
     IOACPIPlatformDevice* acpi_device;
     VoodooI2CDeviceNub* api;
@@ -251,6 +291,7 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
     bool ready_for_input;
     bool* reset_event;
     bool is_interrupt_started = false;
+    UInt32 quirks = 0;
 
     /* Queries the I2C-HID device for an input report
      *

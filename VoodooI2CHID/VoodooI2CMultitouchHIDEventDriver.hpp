@@ -21,7 +21,7 @@
 #include <IOKit/IOService.h>
 
 #include <IOKit/hid/IOHIDEvent.h>
-#include <IOKit/hidevent/IOHIDEventService.h>
+#include <IOKit/hid/IOHIDEventService.h>
 #include <IOKit/hid/IOHIDEventTypes.h>
 #include <IOKit/hidsystem/IOHIDTypes.h>
 #include <IOKit/hid/IOHIDPrivateKeys.h>
@@ -39,6 +39,12 @@
 #include "../../../Dependencies/helpers.hpp"
 
 #define kHIDUsage_Dig_Confidence kHIDUsage_Dig_TouchValid
+
+#define kHIDUsage_LengthUnitCentimeter  0x11
+#define kHIDUsage_LengthUnitInch        0x13
+
+// Allows pen, stylus, touchpad, or touchscreen to be parsed in parseElements
+#define kHIDUsage_Dig_Any               0x00
 
 // Message types defined by ApplePS2Keyboard
 enum {
@@ -62,17 +68,18 @@ class EXPORT VoodooI2CMultitouchHIDEventDriver : public IOHIDEventService {
         OSArray*           styluses = NULL;
         
         OSArray*           wrappers = NULL;
-        OSArray*           transducers= NULL;
+        OSArray*           transducers = NULL;
         
         // report level elements
         
-        IOHIDElement*      contact_count;
-        IOHIDElement*      input_mode;
-        IOHIDElement*      button;
+        IOHIDElement*      contact_count = NULL;
+        IOHIDElement*      input_mode = NULL;
+        IOHIDElement*      primaryButton = NULL;
+        IOHIDElement*      secondaryButton = NULL;
         
         // collection level elements
         
-        IOHIDElement*      contact_count_maximum;
+        IOHIDElement*      contact_count_maximum = NULL;
     
         
         UInt8              current_contact_count = 1;
@@ -87,14 +94,13 @@ class EXPORT VoodooI2CMultitouchHIDEventDriver : public IOHIDEventService {
 
     void calibrateJustifiedPreferredStateElement(IOHIDElement * element, SInt32 removalPercentage);
 
-    /* Notification that a provider has been terminated, sent after recursing up the stack, in leaf-to-root order.
+    /* Notification that a provider will be terminated, this method will release the parent provider.
      * @options The terminated provider of this object.
-     * @defer If there is pending I/O that requires this object to persist, and the provider is not opened by this object set defer to true and call the IOService::didTerminate() implementation when the I/O completes. Otherwise, leave defer set to its default value of false.
      *
      * @return *true*
      */
 
-    bool didTerminate(IOService* provider, IOOptionBits options, bool* defer);
+    bool willTerminate(IOService* provider, IOOptionBits options) override;
 
     /*Gets the latest value of an element by issuing a getReport request to the
      * device. Necessary due to changes between 10.11 and 10.12.
@@ -140,7 +146,17 @@ class EXPORT VoodooI2CMultitouchHIDEventDriver : public IOHIDEventService {
      * @return *true* on successful start, *false* otherwise
      */
 
-    bool handleStart(IOService* provider);
+    bool handleStart(IOService* provider) override;
+
+    /* Parses physical max HID element.
+     * @element The element to parse.
+     *
+     * This function factors reported dimensions with units and exponent.
+     *
+     * @return Physical max dimension in 0.01 mm units.
+     */
+
+    static UInt32 parseElementPhysicalMax(IOHIDElement* element);
 
     /* Parses a digitiser usage page element
      * @element The element to parse
@@ -164,13 +180,7 @@ class EXPORT VoodooI2CMultitouchHIDEventDriver : public IOHIDEventService {
 
     IOReturn parseDigitizerTransducerElement(IOHIDElement* element, IOHIDElement* parent);
 
-    /* Parses all matched elements
-     *
-     * @return *kIOReturnSuccess* on successful parse, *kIOReturnNotFound* if the matched elements are not supported, *kIOReturnError* otherwise
-     */
-
-    IOReturn parseElements();
-
+    
     /* Postprocessing of digitizer elements
      *
      * This function is mostly copied from Apple's own HID Event Driver code. It is responsible for cleaning up malformed report descriptors as well as setting some miscellaneous properties.
@@ -209,7 +219,7 @@ class EXPORT VoodooI2CMultitouchHIDEventDriver : public IOHIDEventService {
      * @return *kIOPMAckImplied* on succesful state change, *kIOReturnError* otherwise
      */
 
-    virtual IOReturn setPowerState(unsigned long whichState, IOService* whatDevice);
+    IOReturn setPowerState(unsigned long whichState, IOService* whatDevice) override;
 
     /* Called during the stop routine to terminate the HID Event Driver
      * @provider The <IOHIDInterface> object which we have matched against.
@@ -217,13 +227,13 @@ class EXPORT VoodooI2CMultitouchHIDEventDriver : public IOHIDEventService {
      * This function is reponsible for releasing the resources allocated in <start>
      */
 
-    void handleStop(IOService* provider);
+    void handleStop(IOService* provider) override;
 
     /* Implemented to set a certain property
      * @provider The <IOHIDInterface> object which we have matched against.
      */
 
-    bool start(IOService* provider);
+    bool start(IOService* provider) override;
     
     /*
      * Called by ApplePS2Controller to notify of keyboard interactions
@@ -233,7 +243,7 @@ class EXPORT VoodooI2CMultitouchHIDEventDriver : public IOHIDEventService {
      *
      * @return kIOReturnSuccess if the message is processed
      */
-    virtual IOReturn message(UInt32 type, IOService* provider, void* argument);
+    IOReturn message(UInt32 type, IOService* provider, void* argument) override;
     
     /*
      * Used to pass user preferences from user mode to the driver
@@ -241,7 +251,7 @@ class EXPORT VoodooI2CMultitouchHIDEventDriver : public IOHIDEventService {
      *
      * @return kIOReturnSuccess if the properties are received successfully, otherwise kIOUnsupported
      */
-    virtual IOReturn setProperties(OSObject * properties);
+    IOReturn setProperties(OSObject * properties) override;
 
  protected:
     const char* name;
@@ -252,6 +262,15 @@ class EXPORT VoodooI2CMultitouchHIDEventDriver : public IOHIDEventService {
     bool should_have_interface = true;
 
     virtual void forwardReport(VoodooI2CMultitouchEvent event, AbsoluteTime timestamp);
+    
+    /* Parses all matched elements
+     * @usage The usage which elements should conform to so they will be parsed.
+     *
+     * If the usage argument is any value other than kHIDUsage_Dig_Any, then only elements which conform to this usage are parsed.
+     *
+     * @return *kIOReturnSuccess* on successful parse, *kIOReturnNotFound* if the matched elements are not supported, *kIOReturnError* otherwise
+     */
+    virtual IOReturn parseElements(UInt32 usage);
 
  private:
     SInt32 absolute_axis_removal_percentage = 15;
